@@ -857,6 +857,24 @@ fn register_host_fns(engine: &mut rhai::Engine, ctx: &Rc<RefCell<Ctx>>) {
         },
     );
 
+    let c = ctx.clone();
+    engine.register_fn("ask_user", move |questions: Dynamic| -> ScriptResult<Dynamic> {
+        let questions_val = dynamic_to_value(questions);
+        let payload = serde_json::json!({ "questions": questions_val });
+        let q_clone = payload.clone();
+        let value = host_call(
+            &c,
+            "ask_user",
+            payload,
+            |reply| WorkflowHostRequest::AskUser {
+                questions: q_clone,
+                reply,
+            },
+            |ans| ans,
+        )?;
+        value_to_dynamic(&value)
+    });
+
     engine.register_fn("fingerprint", |text: &str| -> String {
         crate::journal::request_hash("fingerprint", &serde_json::Value::String(text.to_string()))
     });
@@ -1948,6 +1966,55 @@ mod tests {
                 assert_eq!(result, serde_json::json!("\"</tag>\\nquoted\""));
             }
             other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ask_user_queries_host_and_replays_from_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("journal.jsonl");
+        let script = r#"
+            let meta = #{ name: "t", description: "d" };
+            let ans = ask_user("Which option?");
+            complete(ans);
+        "#;
+
+        let host_called = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let hc = host_called.clone();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let host = spawn_mock_host(rx, move |req| {
+            if let WorkflowHostRequest::AskUser { reply, .. } = req {
+                hc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = reply.send(Ok(serde_json::json!({ "selected": "Option A" })));
+            }
+        });
+
+        let outcome = run_workflow(params(script, Journal::new(Some(journal_path.clone())), tx));
+        host.join().unwrap();
+        assert_eq!(host_called.load(std::sync::atomic::Ordering::SeqCst), 1);
+        match outcome {
+            WorkflowOutcome::Completed { result } => {
+                assert_eq!(result, serde_json::json!({ "selected": "Option A" }));
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+
+        // Replay: host should NOT be called
+        let (tx, rx) = mpsc::unbounded_channel();
+        let hc = host_called.clone();
+        let host = spawn_mock_host(rx, move |req| {
+            if let WorkflowHostRequest::AskUser { .. } = req {
+                hc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        let replay = run_workflow(params(script, Journal::load(journal_path).unwrap(), tx));
+        drop(host);
+        assert_eq!(host_called.load(std::sync::atomic::Ordering::SeqCst), 1);
+        match replay {
+            WorkflowOutcome::Completed { result } => {
+                assert_eq!(result, serde_json::json!({ "selected": "Option A" }));
+            }
+            other => panic!("expected Completed on replay, got {other:?}"),
         }
     }
 }

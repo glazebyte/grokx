@@ -131,6 +131,9 @@ fn validate_script_with_agent_budget_and_cancel(
                 R::GitDiffSince { reply, .. } => {
                     let _ = reply.send(Ok("".into()));
                 }
+                R::AskUser { reply, .. } => {
+                    let _ = reply.send(Ok(serde_json::json!({})));
+                }
                 R::Phase { .. } | R::Log { .. } | R::Telemetry { .. } => {}
             }
         }

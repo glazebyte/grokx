@@ -1668,6 +1668,7 @@ pub(crate) async fn spawn_session_actor(
                 );
                 tokio::sync::mpsc::unbounded_channel().0
             }),
+            Some(user_question_tx.clone()),
             Arc::new(|name: &str, fields: &serde_json::Value, replayed: bool| {
                 if !replayed {
                     tracing::info!(event = name, %fields, "workflow telemetry");

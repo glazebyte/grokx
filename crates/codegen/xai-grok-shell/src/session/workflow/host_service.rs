@@ -82,6 +82,11 @@ pub(crate) struct WorkflowHostParams {
     pub subagent_event_tx: mpsc::UnboundedSender<
         xai_grok_tools::implementations::grok_build::task::types::SubagentEvent,
     >,
+    pub user_question_tx: Option<
+        mpsc::UnboundedSender<
+            xai_grok_tools::implementations::grok_build::ask_user_question::types::UserQuestionRequest,
+        >,
+    >,
     pub parent_session_id: String,
     pub allow_fork_context: bool,
     pub effort: Option<xai_grok_sampling_types::ReasoningEffort>,
@@ -152,6 +157,9 @@ fn reply_cancelled(req: WorkflowHostRequest) {
         | R::WriteScratchFile { reply, .. }
         | R::ReadScratchFile { reply, .. }
         | R::GitDiffSince { reply, .. } => {
+            let _ = reply.send(Err(HostError::Cancelled));
+        }
+        R::AskUser { reply, .. } => {
             let _ = reply.send(Err(HostError::Cancelled));
         }
         R::Phase { .. } | R::Log { .. } | R::Telemetry { .. } => {}
@@ -352,6 +360,12 @@ impl HostService {
                 let svc = self.clone();
                 tokio::spawn(async move {
                     let _ = reply.send(svc.git_diff_since(&commit).await);
+                });
+            }
+            WorkflowHostRequest::AskUser { questions, reply } => {
+                let svc = self.clone();
+                tokio::spawn(async move {
+                    let _ = reply.send(svc.ask_user(questions).await);
                 });
             }
         }
@@ -970,6 +984,177 @@ impl HostService {
         }
         Ok(text)
     }
+
+    async fn ask_user(&self, questions_val: serde_json::Value) -> Result<serde_json::Value, HostError> {
+        use xai_grok_tools::implementations::grok_build::ask_user_question::{
+            Question, QuestionOption,
+            types::{UserQuestionRequest, UserQuestionResponse},
+        };
+
+        let user_question_tx = self
+            .params
+            .user_question_tx
+            .as_ref()
+            .ok_or_else(|| HostError::Failed("interactive ask_user not supported in this session".into()))?;
+
+        // Parse questions_val: can be string, object, or array
+        let raw_questions = match questions_val {
+            serde_json::Value::Object(mut map) => map.remove("questions").unwrap_or(serde_json::Value::Object(map)),
+            other => other,
+        };
+
+        let questions: Vec<Question> = match raw_questions {
+            serde_json::Value::String(q_text) => {
+                vec![Question {
+                    question: q_text,
+                    options: vec![],
+                    multi_select: Some(false),
+                    id: None,
+                }]
+            }
+            serde_json::Value::Array(items) => {
+                let mut qs = Vec::new();
+                for item in items {
+                    match item {
+                        serde_json::Value::String(q_text) => {
+                            qs.push(Question {
+                                question: q_text,
+                                options: vec![],
+                                multi_select: Some(false),
+                                id: None,
+                            });
+                        }
+                        serde_json::Value::Object(map) => {
+                            let q_text = map.get("question").and_then(|v| v.as_str()).unwrap_or("Question").to_string();
+                            let multi = map.get("multi_select").and_then(|v| v.as_bool());
+                            let mut options = Vec::new();
+                            if let Some(opts_array) = map.get("options").and_then(|v| v.as_array()) {
+                                for opt in opts_array {
+                                    match opt {
+                                        serde_json::Value::String(s) => options.push(QuestionOption {
+                                            label: s.clone(),
+                                            description: s.clone(),
+                                            preview: None,
+                                            id: None,
+                                        }),
+                                        serde_json::Value::Object(opt_map) => {
+                                            let label = opt_map.get("label").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                            let desc = opt_map.get("description").and_then(|v| v.as_str()).unwrap_or(&label).to_string();
+                                            let preview = opt_map.get("preview").and_then(|v| v.as_str()).map(|s| s.to_string());
+                                            options.push(QuestionOption {
+                                                label,
+                                                description: desc,
+                                                preview,
+                                                id: None,
+                                            });
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            qs.push(Question {
+                                question: q_text,
+                                options,
+                                multi_select: multi,
+                                id: None,
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+                qs
+            }
+            serde_json::Value::Object(map) => {
+                let q_text = map.get("question").and_then(|v| v.as_str()).unwrap_or("Question").to_string();
+                let multi = map.get("multi_select").and_then(|v| v.as_bool());
+                let mut options = Vec::new();
+                if let Some(opts_array) = map.get("options").and_then(|v| v.as_array()) {
+                    for opt in opts_array {
+                        match opt {
+                            serde_json::Value::String(s) => options.push(QuestionOption {
+                                label: s.clone(),
+                                description: s.clone(),
+                                preview: None,
+                                id: None,
+                            }),
+                            serde_json::Value::Object(opt_map) => {
+                                let label = opt_map.get("label").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let desc = opt_map.get("description").and_then(|v| v.as_str()).unwrap_or(&label).to_string();
+                                let preview = opt_map.get("preview").and_then(|v| v.as_str()).map(|s| s.to_string());
+                                options.push(QuestionOption {
+                                    label,
+                                    description: desc,
+                                    preview,
+                                    id: None,
+                                });
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                vec![Question {
+                    question: q_text,
+                    options,
+                    multi_select: multi,
+                    id: None,
+                }]
+            }
+            _ => {
+                return Err(HostError::Failed("ask_user expects a question string, map, or array".into()));
+            }
+        };
+
+        if questions.is_empty() {
+            return Err(HostError::Failed("ask_user requires at least one question".into()));
+        }
+
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let tool_call_id = format!("workflow-question-{}", self.params.run_id);
+        user_question_tx
+            .send(UserQuestionRequest {
+                tool_call_id,
+                questions: questions.clone(),
+                result_tx,
+            })
+            .map_err(|_| HostError::Failed("user question receiver closed".into()))?;
+
+        tokio::select! {
+            biased;
+            _ = self.params.cancel.cancelled() => Err(HostError::Cancelled),
+            res = result_rx => {
+                match res {
+                    Ok(Ok(UserQuestionResponse::Accepted { answers, .. })) => {
+                        let mut out = serde_json::Map::new();
+                        for (q, ans_vec) in answers {
+                            if ans_vec.len() == 1 {
+                                out.insert(q, serde_json::Value::String(ans_vec[0].clone()));
+                            } else {
+                                out.insert(q, serde_json::to_value(ans_vec).unwrap_or(serde_json::Value::Null));
+                            }
+                        }
+                        Ok(serde_json::Value::Object(out))
+                    }
+                    Ok(Ok(UserQuestionResponse::Cancelled)) => Err(HostError::Cancelled),
+                    Ok(Ok(UserQuestionResponse::ChatAboutThis { partial_answers, .. })) => {
+                        let mut out = serde_json::Map::new();
+                        for (k, v) in partial_answers {
+                            out.insert(k, serde_json::Value::String(v));
+                        }
+                        Ok(serde_json::Value::Object(out))
+                    }
+                    Ok(Ok(UserQuestionResponse::SkipInterview { partial_answers, .. })) => {
+                        let mut out = serde_json::Map::new();
+                        for (k, v) in partial_answers {
+                            out.insert(k, serde_json::Value::String(v));
+                        }
+                        Ok(serde_json::Value::Object(out))
+                    }
+                    Ok(Err(err)) => Err(HostError::Failed(format!("{err:?}"))),
+                    Err(_) => Err(HostError::Failed("user question dropped".into())),
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1009,6 +1194,7 @@ mod tests {
                 store,
                 notify,
                 subagent_event_tx,
+                user_question_tx: None,
                 parent_session_id: "parent".into(),
                 allow_fork_context: false,
                 effort: None,
@@ -1239,6 +1425,66 @@ mod tests {
 
         drop(host_tx);
         cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+
+    #[tokio::test]
+    async fn ask_user_request_dispatches_to_user_question_channel() {
+        let run_id = "wf_ask_user_test".to_string();
+        let tracker = Arc::new(parking_lot::Mutex::new(WorkflowTracker::default()));
+        let (subagent_tx, _subagent_rx) = mpsc::unbounded_channel();
+        let (mut params, _persist_rx) = test_host_params(
+            &run_id,
+            2,
+            "wf-scratch-ask-user",
+            tracker,
+            subagent_tx,
+        );
+
+        let (uq_tx, mut uq_rx) = mpsc::unbounded_channel();
+        params.user_question_tx = Some(uq_tx);
+
+        let (host_tx, host_rx) = mpsc::unbounded_channel();
+        let (handle, _drained) = spawn_workflow_host_service(params, host_rx);
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        host_tx
+            .send(WorkflowHostRequest::AskUser {
+                questions: serde_json::json!({
+                    "question": "Choose target environment",
+                    "options": ["staging", "production"]
+                }),
+                reply: reply_tx,
+            })
+            .expect("send ask user request");
+
+        let uq_req = tokio::time::timeout(Duration::from_secs(5), uq_rx.recv())
+            .await
+            .expect("received user question request")
+            .expect("channel open");
+
+        assert_eq!(uq_req.questions.len(), 1);
+        assert_eq!(uq_req.questions[0].question, "Choose target environment");
+        assert_eq!(uq_req.questions[0].options.len(), 2);
+
+        let mut answers = indexmap::IndexMap::new();
+        answers.insert("Choose target environment".to_string(), vec!["production".to_string()]);
+        uq_req.result_tx.send(Ok(
+            xai_grok_tools::implementations::grok_build::ask_user_question::types::UserQuestionResponse::Accepted {
+                answers,
+                annotations: None,
+            }
+        )).expect("send answer");
+
+        let reply = tokio::time::timeout(Duration::from_secs(5), reply_rx)
+            .await
+            .expect("received reply")
+            .expect("reply sender alive")
+            .expect("host error none");
+
+        assert_eq!(reply, serde_json::json!({ "Choose target environment": "production" }));
+
+        drop(host_tx);
         let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
     }
 }

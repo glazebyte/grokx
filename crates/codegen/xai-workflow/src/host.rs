@@ -109,6 +109,10 @@ pub enum WorkflowHostRequest {
         commit: String,
         reply: oneshot::Sender<Result<String, HostError>>,
     },
+    AskUser {
+        questions: serde_json::Value,
+        reply: oneshot::Sender<Result<serde_json::Value, HostError>>,
+    },
 }
 
 impl WorkflowHostRequest {
@@ -125,6 +129,7 @@ impl WorkflowHostRequest {
             Self::WriteScratchFile { .. } => "write_scratch_file",
             Self::ReadScratchFile { .. } => "read_scratch_file",
             Self::GitDiffSince { .. } => "git_diff_since",
+            Self::AskUser { .. } => "ask_user",
         }
     }
 }

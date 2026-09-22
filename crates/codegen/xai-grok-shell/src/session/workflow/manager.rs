@@ -87,6 +87,11 @@ pub(crate) struct WorkflowManager {
     subagent_event_tx: mpsc::UnboundedSender<
         xai_grok_tools::implementations::grok_build::task::types::SubagentEvent,
     >,
+    user_question_tx: Option<
+        mpsc::UnboundedSender<
+            xai_grok_tools::implementations::grok_build::ask_user_question::types::UserQuestionRequest,
+        >,
+    >,
     telemetry: TelemetryHook,
     session_cmd_tx: mpsc::UnboundedSender<crate::session::commands::SessionCommand>,
     templates: HashMap<String, String>,
@@ -110,6 +115,11 @@ impl WorkflowManager {
         subagent_event_tx: mpsc::UnboundedSender<
             xai_grok_tools::implementations::grok_build::task::types::SubagentEvent,
         >,
+        user_question_tx: Option<
+            mpsc::UnboundedSender<
+                xai_grok_tools::implementations::grok_build::ask_user_question::types::UserQuestionRequest,
+            >,
+        >,
         telemetry: TelemetryHook,
         session_cmd_tx: mpsc::UnboundedSender<crate::session::commands::SessionCommand>,
         templates: HashMap<String, String>,
@@ -125,6 +135,7 @@ impl WorkflowManager {
             store,
             notify,
             subagent_event_tx,
+            user_question_tx,
             telemetry,
             session_cmd_tx,
             templates,
@@ -309,6 +320,7 @@ impl WorkflowManager {
                 store: self.store.clone(),
                 notify: self.notify.clone(),
                 subagent_event_tx: self.subagent_event_tx.clone(),
+                user_question_tx: self.user_question_tx.clone(),
                 parent_session_id: self.session_id.clone(),
                 allow_fork_context,
                 effort: spec.effort,
@@ -537,6 +549,7 @@ impl WorkflowManager {
             store,
             notify,
             mpsc::unbounded_channel().0,
+            None,
             Arc::new(|_, _, _| {}),
             mpsc::unbounded_channel().0,
             std::collections::HashMap::new(),
@@ -959,6 +972,7 @@ mod tests {
             store,
             notify,
             subagent_tx,
+            None,
             Arc::new(|_, _, _| {}),
             mpsc::unbounded_channel().0,
             HashMap::new(),
