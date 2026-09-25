@@ -997,10 +997,57 @@ impl HostService {
             .as_ref()
             .ok_or_else(|| HostError::Failed("interactive ask_user not supported in this session".into()))?;
 
-        // Parse questions_val: can be string, object, or array
+        let mut use_id_keyed_format = false;
+        let mut input_opts_map = None;
+
         let raw_questions = match questions_val {
-            serde_json::Value::Object(mut map) => map.remove("questions").unwrap_or(serde_json::Value::Object(map)),
+            serde_json::Value::Object(mut map) => {
+                if let Some(v) = map.remove("use_id_keyed_format").and_then(|v| v.as_bool()) {
+                    use_id_keyed_format = v;
+                }
+                let q_val = map.remove("questions");
+                input_opts_map = Some(map);
+                q_val.unwrap_or(serde_json::Value::Null)
+            }
             other => other,
+        };
+
+        let parse_single_question_obj = |map: &serde_json::Map<String, serde_json::Value>| -> Question {
+            let q_text = map.get("question").and_then(|v| v.as_str()).unwrap_or("Question").to_string();
+            let multi = map.get("multi_select").and_then(|v| v.as_bool());
+            let q_id = map.get("id").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let mut options = Vec::new();
+            if let Some(opts_array) = map.get("options").and_then(|v| v.as_array()) {
+                for opt in opts_array {
+                    match opt {
+                        serde_json::Value::String(s) => options.push(QuestionOption {
+                            label: s.clone(),
+                            description: s.clone(),
+                            preview: None,
+                            id: None,
+                        }),
+                        serde_json::Value::Object(opt_map) => {
+                            let label = opt_map.get("label").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            let desc = opt_map.get("description").and_then(|v| v.as_str()).unwrap_or(&label).to_string();
+                            let preview = opt_map.get("preview").and_then(|v| v.as_str()).map(|s| s.to_string());
+                            let opt_id = opt_map.get("id").and_then(|v| v.as_str()).map(|s| s.to_string());
+                            options.push(QuestionOption {
+                                label,
+                                description: desc,
+                                preview,
+                                id: opt_id,
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Question {
+                question: q_text,
+                options,
+                multi_select: multi,
+                id: q_id,
+            }
         };
 
         let questions: Vec<Question> = match raw_questions {
@@ -1024,83 +1071,23 @@ impl HostService {
                                 id: None,
                             });
                         }
-                        serde_json::Value::Object(map) => {
-                            let q_text = map.get("question").and_then(|v| v.as_str()).unwrap_or("Question").to_string();
-                            let multi = map.get("multi_select").and_then(|v| v.as_bool());
-                            let mut options = Vec::new();
-                            if let Some(opts_array) = map.get("options").and_then(|v| v.as_array()) {
-                                for opt in opts_array {
-                                    match opt {
-                                        serde_json::Value::String(s) => options.push(QuestionOption {
-                                            label: s.clone(),
-                                            description: s.clone(),
-                                            preview: None,
-                                            id: None,
-                                        }),
-                                        serde_json::Value::Object(opt_map) => {
-                                            let label = opt_map.get("label").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                                            let desc = opt_map.get("description").and_then(|v| v.as_str()).unwrap_or(&label).to_string();
-                                            let preview = opt_map.get("preview").and_then(|v| v.as_str()).map(|s| s.to_string());
-                                            options.push(QuestionOption {
-                                                label,
-                                                description: desc,
-                                                preview,
-                                                id: None,
-                                            });
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            }
-                            qs.push(Question {
-                                question: q_text,
-                                options,
-                                multi_select: multi,
-                                id: None,
-                            });
+                        serde_json::Value::Object(ref map) => {
+                            qs.push(parse_single_question_obj(map));
                         }
                         _ => {}
                     }
                 }
                 qs
             }
-            serde_json::Value::Object(map) => {
-                let q_text = map.get("question").and_then(|v| v.as_str()).unwrap_or("Question").to_string();
-                let multi = map.get("multi_select").and_then(|v| v.as_bool());
-                let mut options = Vec::new();
-                if let Some(opts_array) = map.get("options").and_then(|v| v.as_array()) {
-                    for opt in opts_array {
-                        match opt {
-                            serde_json::Value::String(s) => options.push(QuestionOption {
-                                label: s.clone(),
-                                description: s.clone(),
-                                preview: None,
-                                id: None,
-                            }),
-                            serde_json::Value::Object(opt_map) => {
-                                let label = opt_map.get("label").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                                let desc = opt_map.get("description").and_then(|v| v.as_str()).unwrap_or(&label).to_string();
-                                let preview = opt_map.get("preview").and_then(|v| v.as_str()).map(|s| s.to_string());
-                                options.push(QuestionOption {
-                                    label,
-                                    description: desc,
-                                    preview,
-                                    id: None,
-                                });
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                vec![Question {
-                    question: q_text,
-                    options,
-                    multi_select: multi,
-                    id: None,
-                }]
+            serde_json::Value::Object(ref map) => {
+                vec![parse_single_question_obj(map)]
             }
             _ => {
-                return Err(HostError::Failed("ask_user expects a question string, map, or array".into()));
+                if let Some(map) = input_opts_map {
+                    vec![parse_single_question_obj(&map)]
+                } else {
+                    return Err(HostError::Failed("ask_user expects a question string, map, or array".into()));
+                }
             }
         };
 
@@ -1122,31 +1109,65 @@ impl HostService {
             biased;
             _ = self.params.cancel.cancelled() => Err(HostError::Cancelled),
             res = result_rx => {
+                use xai_grok_tools::implementations::grok_build::ask_user_question::format;
                 match res {
-                    Ok(Ok(UserQuestionResponse::Accepted { answers, .. })) => {
-                        let mut out = serde_json::Map::new();
-                        for (q, ans_vec) in answers {
+                    Ok(Ok(UserQuestionResponse::Accepted { answers, annotations })) => {
+                        let formatted_text = if use_id_keyed_format {
+                            format::format_id_keyed_accepted_tool_result(
+                                &questions,
+                                &answers,
+                                &annotations,
+                            )
+                        } else {
+                            format::format_accepted_tool_result(&answers, &annotations)
+                        };
+                        let mut answers_obj = serde_json::Map::new();
+                        for (q, ans_vec) in &answers {
                             if ans_vec.len() == 1 {
-                                out.insert(q, serde_json::Value::String(ans_vec[0].clone()));
+                                answers_obj.insert(q.clone(), serde_json::Value::String(ans_vec[0].clone()));
                             } else {
-                                out.insert(q, serde_json::to_value(ans_vec).unwrap_or(serde_json::Value::Null));
+                                answers_obj.insert(q.clone(), serde_json::to_value(ans_vec).unwrap_or(serde_json::Value::Null));
                             }
+                        }
+                        let mut out = serde_json::Map::new();
+                        out.insert("outcome".into(), serde_json::Value::String("accepted".into()));
+                        out.insert("answers".into(), serde_json::Value::Object(answers_obj));
+                        out.insert("text".into(), serde_json::Value::String(formatted_text));
+                        if let Some(ref anns) = annotations {
+                            out.insert("annotations".into(), serde_json::to_value(anns).unwrap_or(serde_json::Value::Null));
                         }
                         Ok(serde_json::Value::Object(out))
                     }
-                    Ok(Ok(UserQuestionResponse::Cancelled)) => Err(HostError::Cancelled),
-                    Ok(Ok(UserQuestionResponse::ChatAboutThis { partial_answers, .. })) => {
+                    Ok(Ok(UserQuestionResponse::Cancelled)) => {
+                        let text = format::CANCEL_TEXT;
                         let mut out = serde_json::Map::new();
+                        out.insert("outcome".into(), serde_json::Value::String("cancelled".into()));
+                        out.insert("text".into(), serde_json::Value::String(text.into()));
+                        out.insert("answers".into(), serde_json::Value::Object(serde_json::Map::new()));
+                        Ok(serde_json::Value::Object(out))
+                    }
+                    Ok(Ok(UserQuestionResponse::ChatAboutThis { partial_answers, .. })) => {
+                        let text = format::format_chat_about_this(&questions, &partial_answers);
+                        let mut out = serde_json::Map::new();
+                        out.insert("outcome".into(), serde_json::Value::String("chat_about_this".into()));
+                        out.insert("text".into(), serde_json::Value::String(text));
+                        let mut partial_map = serde_json::Map::new();
                         for (k, v) in partial_answers {
-                            out.insert(k, serde_json::Value::String(v));
+                            partial_map.insert(k, serde_json::Value::String(v));
                         }
+                        out.insert("answers".into(), serde_json::Value::Object(partial_map));
                         Ok(serde_json::Value::Object(out))
                     }
                     Ok(Ok(UserQuestionResponse::SkipInterview { partial_answers, .. })) => {
+                        let text = format::format_skip_interview(&questions, &partial_answers);
                         let mut out = serde_json::Map::new();
+                        out.insert("outcome".into(), serde_json::Value::String("skip_interview".into()));
+                        out.insert("text".into(), serde_json::Value::String(text));
+                        let mut partial_map = serde_json::Map::new();
                         for (k, v) in partial_answers {
-                            out.insert(k, serde_json::Value::String(v));
+                            partial_map.insert(k, serde_json::Value::String(v));
                         }
+                        out.insert("answers".into(), serde_json::Value::Object(partial_map));
                         Ok(serde_json::Value::Object(out))
                     }
                     Ok(Err(err)) => Err(HostError::Failed(format!("{err:?}"))),
@@ -1482,7 +1503,138 @@ mod tests {
             .expect("reply sender alive")
             .expect("host error none");
 
-        assert_eq!(reply, serde_json::json!({ "Choose target environment": "production" }));
+        assert_eq!(reply["outcome"], "accepted");
+        assert_eq!(reply["answers"], serde_json::json!({ "Choose target environment": "production" }));
+        assert!(reply["text"].as_str().unwrap().contains("\"Choose target environment\"=\"production\""));
+
+        // Test id-keyed format option
+        let (reply_tx, reply_rx) = oneshot::channel();
+        host_tx
+            .send(WorkflowHostRequest::AskUser {
+                questions: serde_json::json!({
+                    "use_id_keyed_format": true,
+                    "questions": [{
+                        "id": "q1",
+                        "question": "Deploy mode?",
+                        "options": [{ "id": "o1", "label": "Canary", "description": "Canary deployment" }]
+                    }]
+                }),
+                reply: reply_tx,
+            })
+            .expect("send id keyed ask user request");
+
+        let uq_req = tokio::time::timeout(Duration::from_secs(5), uq_rx.recv())
+            .await
+            .expect("received user question request")
+            .expect("channel open");
+        assert_eq!(uq_req.questions[0].id.as_deref(), Some("q1"));
+
+        let mut answers = indexmap::IndexMap::new();
+        answers.insert("Deploy mode?".to_string(), vec!["Canary".to_string()]);
+        uq_req.result_tx.send(Ok(
+            xai_grok_tools::implementations::grok_build::ask_user_question::types::UserQuestionResponse::Accepted {
+                answers,
+                annotations: None,
+            }
+        )).expect("send answer");
+
+        let reply = tokio::time::timeout(Duration::from_secs(5), reply_rx)
+            .await
+            .expect("received reply")
+            .expect("reply sender alive")
+            .expect("host error none");
+
+        assert_eq!(reply["outcome"], "accepted");
+        assert!(reply["text"].as_str().unwrap().contains("Question q1: Selected option(s) o1"));
+
+        // Test ChatAboutThis (Path B)
+        let (reply_tx, reply_rx) = oneshot::channel();
+        host_tx
+            .send(WorkflowHostRequest::AskUser {
+                questions: serde_json::json!("Explain requirement"),
+                reply: reply_tx,
+            })
+            .expect("send chat about this request");
+
+        let uq_req = tokio::time::timeout(Duration::from_secs(5), uq_rx.recv())
+            .await
+            .expect("received user question request")
+            .expect("channel open");
+
+        let mut partial = std::collections::HashMap::new();
+        partial.insert("Explain requirement".to_string(), "More details needed".to_string());
+        uq_req.result_tx.send(Ok(
+            xai_grok_tools::implementations::grok_build::ask_user_question::types::UserQuestionResponse::ChatAboutThis {
+                questions: uq_req.questions.clone(),
+                partial_answers: partial,
+            }
+        )).expect("send chat about this answer");
+
+        let reply = tokio::time::timeout(Duration::from_secs(5), reply_rx)
+            .await
+            .expect("received reply")
+            .expect("reply sender alive")
+            .expect("host error none");
+
+        assert_eq!(reply["outcome"], "chat_about_this");
+        assert!(reply["text"].as_str().unwrap().contains("The user wants to clarify these questions"));
+
+        // Test SkipInterview (Path C)
+        let (reply_tx, reply_rx) = oneshot::channel();
+        host_tx
+            .send(WorkflowHostRequest::AskUser {
+                questions: serde_json::json!("Skip question"),
+                reply: reply_tx,
+            })
+            .expect("send skip interview request");
+
+        let uq_req = tokio::time::timeout(Duration::from_secs(5), uq_rx.recv())
+            .await
+            .expect("received user question request")
+            .expect("channel open");
+
+        uq_req.result_tx.send(Ok(
+            xai_grok_tools::implementations::grok_build::ask_user_question::types::UserQuestionResponse::SkipInterview {
+                questions: uq_req.questions.clone(),
+                partial_answers: std::collections::HashMap::new(),
+            }
+        )).expect("send skip interview answer");
+
+        let reply = tokio::time::timeout(Duration::from_secs(5), reply_rx)
+            .await
+            .expect("received reply")
+            .expect("reply sender alive")
+            .expect("host error none");
+
+        assert_eq!(reply["outcome"], "skip_interview");
+        assert!(reply["text"].as_str().unwrap().contains("The user has indicated they have provided enough answers"));
+
+        // Test Cancelled (Path D)
+        let (reply_tx, reply_rx) = oneshot::channel();
+        host_tx
+            .send(WorkflowHostRequest::AskUser {
+                questions: serde_json::json!("Cancel question"),
+                reply: reply_tx,
+            })
+            .expect("send cancel request");
+
+        let uq_req = tokio::time::timeout(Duration::from_secs(5), uq_rx.recv())
+            .await
+            .expect("received user question request")
+            .expect("channel open");
+
+        uq_req.result_tx.send(Ok(
+            xai_grok_tools::implementations::grok_build::ask_user_question::types::UserQuestionResponse::Cancelled
+        )).expect("send cancel answer");
+
+        let reply = tokio::time::timeout(Duration::from_secs(5), reply_rx)
+            .await
+            .expect("received reply")
+            .expect("reply sender alive")
+            .expect("host error none");
+
+        assert_eq!(reply["outcome"], "cancelled");
+        assert_eq!(reply["text"], xai_grok_tools::implementations::grok_build::ask_user_question::format::CANCEL_TEXT);
 
         drop(host_tx);
         let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
